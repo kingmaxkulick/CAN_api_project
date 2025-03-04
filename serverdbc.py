@@ -1,11 +1,15 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import uvicorn
 import cantools
 import can
 import threading
 import time
 import os
+import csv
+from datetime import datetime
+from typing import Dict, List, Any
 
 app = FastAPI()
 
@@ -43,6 +47,16 @@ print(f"✅ Available CAN Messages: {valid_can_ids}")
 vehicle_data = {}
 # Flag to control the CAN receiver thread
 run_can_receiver = True
+
+# Logging-related global variables
+is_logging = False
+log_data = []
+log_start_time = None
+current_log_id = 0
+log_directory = "./logs"
+
+# Ensure log directory exists
+os.makedirs(log_directory, exist_ok=True)
 
 # Function to receive and decode real CAN data from PEAK CAN
 def receive_can_data():
@@ -131,6 +145,36 @@ can_thread.start()
 
 @app.get("/vehicle_data")
 async def get_vehicle_data():
+    global vehicle_data, is_logging, log_data, log_start_time
+    
+    # If logging is active, add the current data to the log
+    if is_logging:
+        timestamp = datetime.now()
+        
+        # Only log if at least 0.5 seconds has passed since last log
+        if not hasattr(app.state, 'last_log_time') or (timestamp - app.state.last_log_time).total_seconds() >= 0.5:
+            elapsed_ms = int((timestamp - log_start_time).total_seconds() * 1000) if log_start_time else 0
+            
+            # Create a log entry with timestamp
+            log_entry = {
+                "timestamp": timestamp.isoformat(),
+                "elapsed_ms": elapsed_ms
+            }
+            
+            # Check if we're logging specific signals or all data
+            signals_to_log = getattr(app.state, 'signals_to_log', None)
+            
+            if signals_to_log:
+                # Only log the specified signals
+                filtered_data = {key: vehicle_data[key] for key in signals_to_log if key in vehicle_data}
+                log_entry.update(filtered_data)
+            else:
+                # Log all vehicle data
+                log_entry.update(vehicle_data)
+                
+            log_data.append(log_entry)
+            app.state.last_log_time = timestamp
+    
     return vehicle_data
 
 @app.post("/upload_dbc/")
@@ -176,11 +220,220 @@ async def get_statistics():
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+@app.get("/logging/debug")
+async def debug_logging():
+    signals_to_log = getattr(app.state, 'signals_to_log', None)
+    sample_vehicle_data = {}
+    
+    # Get a small sample of vehicle data keys
+    if vehicle_data:
+        sample_keys = list(vehicle_data.keys())[:5]
+        sample_vehicle_data = {k: vehicle_data[k] for k in sample_keys}
+    
+    return {
+        "is_logging": is_logging,
+        "signals_to_log": signals_to_log,
+        "signals_to_log_count": len(signals_to_log) if signals_to_log else 0,
+        "app_state_keys": [key for key in dir(app.state) if not key.startswith('_')],
+        "sample_vehicle_data_keys": list(vehicle_data.keys())[:10] if vehicle_data else [],
+        "vehicle_data_count": len(vehicle_data) if vehicle_data else 0,
+        "sample_vehicle_data": sample_vehicle_data
+    }
+
+# ===== LOGGING API ENDPOINTS =====
+
+@app.get("/logging/status")
+async def get_logging_status():
+    global is_logging, log_data, current_log_id
+    return {
+        "is_logging": is_logging,
+        "entries_count": len(log_data),
+        "current_log_id": current_log_id
+    }
+
+# Define a Pydantic model for the request
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+class LoggingRequest(BaseModel):
+    signals_to_log: Optional[List[str]] = None
+
+@app.post("/logging/start")
+async def start_logging(request: LoggingRequest):
+    global is_logging, log_data, log_start_time, current_log_id
+    
+    if is_logging:
+        return {"status": "already_logging", "message": "Logging is already in progress"}
+    
+    # Clear previous log data and start fresh
+    log_data = []
+    log_start_time = datetime.now()
+    is_logging = True
+    
+    # Store the list of signals to log if provided
+    signals_to_log = request.signals_to_log
+    app.state.signals_to_log = signals_to_log
+    
+    # Find the next log ID
+    current_log_id = 1
+    while os.path.exists(os.path.join(log_directory, f"keymetrics-{current_log_id}.csv")):
+        current_log_id += 1
+    
+    print(f"✅ Started logging with ID {current_log_id}")
+    if signals_to_log:
+        print(f"  📊 Logging {len(signals_to_log)} specific signals")
+        for sig in signals_to_log[:5]:  # Print first 5 for debugging
+            print(f"      - {sig}")
+        if len(signals_to_log) > 5:
+            print(f"      - ... and {len(signals_to_log) - 5} more")
+    else:
+        print(f"  📊 Logging all signals")
+        
+    return {
+        "status": "started", 
+        "message": f"Logging started with ID {current_log_id}",
+        "log_id": current_log_id,
+        "signals_count": len(signals_to_log) if signals_to_log else "all"
+    }
+
+@app.post("/logging/stop")
+async def stop_logging(background_tasks: BackgroundTasks):
+    global is_logging, log_data, current_log_id
+    
+    if not is_logging:
+        return {"status": "not_logging", "message": "Logging is not in progress"}
+    
+    if len(log_data) == 0:
+        is_logging = False
+        return {"status": "empty", "message": "No data logged"}
+    
+    # Generate the filename
+    filename = f"keymetrics-{current_log_id}.csv"
+    filepath = os.path.join(log_directory, filename)
+    
+    # Schedule background task to save the file
+    background_tasks.add_task(save_log_to_csv, log_data, filepath)
+    
+    # Schedule cleanup of old log files (keep only the 5 most recent)
+    background_tasks.add_task(cleanup_old_logs, 5)
+    
+    # Update status
+    is_logging = False
+    
+    print(f"✅ Stopped logging. Saving to {filename} ({len(log_data)} entries)")
+    print(f"🧹 Cleaning up old log files (keeping most recent 5)")
+    return {
+        "status": "stopped", 
+        "message": f"Logging stopped. Saving to {filename}",
+        "log_id": current_log_id,
+        "entry_count": len(log_data),
+        "filename": filename
+    }
+
+@app.get("/logging/download/{log_id}")
+async def download_log(log_id: int):
+    filepath = os.path.join(log_directory, f"keymetrics-{log_id}.csv")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"Log file keymetrics-{log_id}.csv not found")
+    
+    return FileResponse(
+        filepath, 
+        media_type="text/csv", 
+        filename=f"keymetrics-{log_id}.csv"
+    )
+
+@app.get("/logging/list")
+async def list_logs():
+    log_files = []
+    for filename in os.listdir(log_directory):
+        if filename.startswith("keymetrics-") and filename.endswith(".csv"):
+            filepath = os.path.join(log_directory, filename)
+            log_files.append({
+                "filename": filename,
+                "size_bytes": os.path.getsize(filepath),
+                "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat(),
+                "id": int(filename.split("-")[1].split(".")[0])
+            })
+    
+    return sorted(log_files, key=lambda x: x["id"])
+
+# Helper function to save log data to CSV
+def save_log_to_csv(data: List[Dict[str, Any]], filepath: str):
+    if not data:
+        return False
+    
+    try:
+        # Get all possible field names from the data
+        fieldnames = set()
+        for entry in data:
+            fieldnames.update(entry.keys())
+        
+        # Sort fieldnames for consistent column order - timestamp and elapsed_ms first
+        sorted_fieldnames = ["timestamp", "elapsed_ms"]
+        sorted_fieldnames.extend(sorted([f for f in fieldnames if f not in sorted_fieldnames]))
+        
+        # Write to CSV file
+        with open(filepath, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=sorted_fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+        
+        print(f"✅ Log file saved successfully: {filepath}")
+        return True
+    except Exception as e:
+        print(f"❌ Error saving log file: {e}")
+        return False
+
+# Helper function to clean up old log files
+def cleanup_old_logs(max_files_to_keep=5):
+    try:
+        # Get all log files
+        log_files = []
+        for filename in os.listdir(log_directory):
+            if filename.startswith("keymetrics-") and filename.endswith(".csv"):
+                filepath = os.path.join(log_directory, filename)
+                log_files.append({
+                    "filename": filename,
+                    "filepath": filepath,
+                    "created": os.path.getctime(filepath),
+                    "id": int(filename.split("-")[1].split(".")[0])
+                })
+        
+        # Sort by creation time (newest first)
+        log_files.sort(key=lambda x: x["created"], reverse=True)
+        
+        # If we have more files than the limit, delete the oldest ones
+        if len(log_files) > max_files_to_keep:
+            files_to_delete = log_files[max_files_to_keep:]
+            for file_info in files_to_delete:
+                try:
+                    os.remove(file_info["filepath"])
+                    print(f"🗑️ Deleted old log file: {file_info['filename']}")
+                except Exception as e:
+                    print(f"⚠️ Error deleting {file_info['filename']}: {e}")
+            
+            return len(files_to_delete)
+        return 0
+    except Exception as e:
+        print(f"⚠️ Error during log cleanup: {e}")
+        return 0
+
 # Gracefully handle shutdown
 @app.on_event("shutdown")
 def shutdown_event():
-    global run_can_receiver
+    global run_can_receiver, is_logging
     print("🛑 Shutting down CAN receiver")
+    
+    # Stop logging if active
+    if is_logging:
+        print("⚠️ Logging was active during shutdown, attempting to save data...")
+        is_logging = False
+        
+        if log_data and len(log_data) > 0:
+            filename = f"keymetrics-{current_log_id}.csv"
+            filepath = os.path.join(log_directory, filename)
+            save_log_to_csv(log_data, filepath)
+    
     run_can_receiver = False
     # Give the thread time to clean up
     time.sleep(0.5)
