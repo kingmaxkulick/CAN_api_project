@@ -25,7 +25,7 @@ app.add_middleware(
 # Load multiple DBC files
 DBC_FILE_PATHS = [
     r"C:\Users\MaxKulick\Downloads\INV_CAN_cm.dbc",
-    r"C:\Users\MaxKulick\Downloads\vcu_bms_prop_can.dbc"
+    r"C:\Users\MaxKulick\Downloads\NX0002-STS01_A01 (2).dbc"
 ]
 
 # Initialize an empty database
@@ -52,8 +52,14 @@ run_can_receiver = True
 is_logging = False
 log_data = []
 log_start_time = None
+logging_thread = None
+log_interval = 5 # 5 milliseconds
 current_log_id = 0
 log_directory = "./logs"
+signals_to_log = None
+
+# Thread stop event
+stop_logging_event = threading.Event()
 
 # Ensure log directory exists
 os.makedirs(log_directory, exist_ok=True)
@@ -64,8 +70,6 @@ def receive_can_data():
     
     try:
         # Initialize the CAN bus with PEAK CAN interface
-        # For PCAN use 'pcan' as the interface
-        # You may need to specify a specific channel like 'PCAN_USBBUS1'
         bus = can.interface.Bus(bustype='pcan', channel='PCAN_USBBUS1', bitrate=500000)
         print("✅ Connected to PEAK CAN interface")
         
@@ -139,42 +143,55 @@ def generate_mock_can_data():
         # Print just a confirmation that all signals were updated
         print(f"📡 Updated all mock CAN signals at {time.strftime('%H:%M:%S')}")
 
+# Dedicated background thread function for logging at precise intervals
+def logging_thread_function():
+    global log_data, vehicle_data, signals_to_log, log_start_time
+    
+    print(f"🕒 Starting high-frequency logging thread (interval: {log_interval*1000}ms)")
+    log_count = 0
+    last_report_time = time.time()
+    
+    while not stop_logging_event.is_set():
+        # Get current timestamp
+        timestamp = datetime.now()
+        elapsed_ms = int((timestamp - log_start_time).total_seconds() * 1000) if log_start_time else 0
+        
+        # Create a log entry with timestamp
+        log_entry = {
+            "timestamp": timestamp.isoformat(),
+            "elapsed_ms": elapsed_ms
+        }
+        
+        # Check if we're logging specific signals or all data
+        if signals_to_log:
+            # Only log the specified signals
+            filtered_data = {key: vehicle_data[key] for key in signals_to_log if key in vehicle_data}
+            log_entry.update(filtered_data)
+        else:
+            # Log all vehicle data
+            log_entry.update(vehicle_data)
+            
+        log_data.append(log_entry)
+        log_count += 1
+        
+        # Report logging status every 1000 entries
+        if log_count % 1000 == 0:
+            current_time = time.time()
+            duration = current_time - last_report_time
+            rate = 1000 / duration if duration > 0 else 0
+            print(f"📊 Logged {log_count} entries (current rate: {rate:.1f} entries/sec)")
+            last_report_time = current_time
+        
+        # Sleep precisely for the logging interval
+        time.sleep(log_interval)
+
 # Start the CAN receiver in a separate thread
 can_thread = threading.Thread(target=receive_can_data, daemon=True)
 can_thread.start()
 
 @app.get("/vehicle_data")
 async def get_vehicle_data():
-    global vehicle_data, is_logging, log_data, log_start_time
-    
-    # If logging is active, add the current data to the log
-    if is_logging:
-        timestamp = datetime.now()
-        
-        # Only log if at least 0.5 seconds has passed since last log
-        if not hasattr(app.state, 'last_log_time') or (timestamp - app.state.last_log_time).total_seconds() >= 0.5:
-            elapsed_ms = int((timestamp - log_start_time).total_seconds() * 1000) if log_start_time else 0
-            
-            # Create a log entry with timestamp
-            log_entry = {
-                "timestamp": timestamp.isoformat(),
-                "elapsed_ms": elapsed_ms
-            }
-            
-            # Check if we're logging specific signals or all data
-            signals_to_log = getattr(app.state, 'signals_to_log', None)
-            
-            if signals_to_log:
-                # Only log the specified signals
-                filtered_data = {key: vehicle_data[key] for key in signals_to_log if key in vehicle_data}
-                log_entry.update(filtered_data)
-            else:
-                # Log all vehicle data
-                log_entry.update(vehicle_data)
-                
-            log_data.append(log_entry)
-            app.state.last_log_time = timestamp
-    
+    global vehicle_data
     return vehicle_data
 
 @app.post("/upload_dbc/")
@@ -206,49 +223,16 @@ async def upload_dbc(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": f"Failed to load DBC file: {str(e)}"}
 
-# Endpoint to get list of available CAN messages
-@app.get("/available_messages")
-async def get_available_messages():
-    return {"messages": valid_can_ids}
-
-# Endpoint to get statistics about received CAN data
-@app.get("/statistics")
-async def get_statistics():
-    return {
-        "total_messages": len(valid_can_ids),
-        "signals_received": len(vehicle_data),
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-@app.get("/logging/debug")
-async def debug_logging():
-    signals_to_log = getattr(app.state, 'signals_to_log', None)
-    sample_vehicle_data = {}
-    
-    # Get a small sample of vehicle data keys
-    if vehicle_data:
-        sample_keys = list(vehicle_data.keys())[:5]
-        sample_vehicle_data = {k: vehicle_data[k] for k in sample_keys}
-    
-    return {
-        "is_logging": is_logging,
-        "signals_to_log": signals_to_log,
-        "signals_to_log_count": len(signals_to_log) if signals_to_log else 0,
-        "app_state_keys": [key for key in dir(app.state) if not key.startswith('_')],
-        "sample_vehicle_data_keys": list(vehicle_data.keys())[:10] if vehicle_data else [],
-        "vehicle_data_count": len(vehicle_data) if vehicle_data else 0,
-        "sample_vehicle_data": sample_vehicle_data
-    }
-
 # ===== LOGGING API ENDPOINTS =====
 
 @app.get("/logging/status")
 async def get_logging_status():
-    global is_logging, log_data, current_log_id
+    global is_logging, log_data, current_log_id, log_interval
     return {
         "is_logging": is_logging,
         "entries_count": len(log_data),
-        "current_log_id": current_log_id
+        "current_log_id": current_log_id,
+        "log_interval_ms": log_interval * 1000  # Convert to milliseconds
     }
 
 # Define a Pydantic model for the request
@@ -257,10 +241,11 @@ from typing import List, Optional, Dict, Any
 
 class LoggingRequest(BaseModel):
     signals_to_log: Optional[List[str]] = None
+    log_interval_ms: Optional[float] = None  # Allow setting interval
 
 @app.post("/logging/start")
 async def start_logging(request: LoggingRequest):
-    global is_logging, log_data, log_start_time, current_log_id
+    global is_logging, log_data, log_start_time, current_log_id, logging_thread, signals_to_log, log_interval, stop_logging_event
     
     if is_logging:
         return {"status": "already_logging", "message": "Logging is already in progress"}
@@ -268,18 +253,28 @@ async def start_logging(request: LoggingRequest):
     # Clear previous log data and start fresh
     log_data = []
     log_start_time = datetime.now()
-    is_logging = True
     
     # Store the list of signals to log if provided
     signals_to_log = request.signals_to_log
-    app.state.signals_to_log = signals_to_log
+    
+    # Update log interval if provided (convert from ms to seconds)
+    if request.log_interval_ms is not None:
+        log_interval = max(0.001, request.log_interval_ms / 1000)  # Ensure minimum 1ms interval
+    
+    # Reset the stop event
+    stop_logging_event.clear()
+    
+    # Start the dedicated logging thread
+    logging_thread = threading.Thread(target=logging_thread_function, daemon=True)
+    logging_thread.start()
+    is_logging = True
     
     # Find the next log ID
     current_log_id = 1
     while os.path.exists(os.path.join(log_directory, f"keymetrics-{current_log_id}.csv")):
         current_log_id += 1
     
-    print(f"✅ Started logging with ID {current_log_id}")
+    print(f"✅ Started logging with ID {current_log_id} (interval: {log_interval*1000}ms)")
     if signals_to_log:
         print(f"  📊 Logging {len(signals_to_log)} specific signals")
         for sig in signals_to_log[:5]:  # Print first 5 for debugging
@@ -293,15 +288,24 @@ async def start_logging(request: LoggingRequest):
         "status": "started", 
         "message": f"Logging started with ID {current_log_id}",
         "log_id": current_log_id,
-        "signals_count": len(signals_to_log) if signals_to_log else "all"
+        "signals_count": len(signals_to_log) if signals_to_log else "all",
+        "log_interval_ms": log_interval * 1000
     }
 
 @app.post("/logging/stop")
 async def stop_logging(background_tasks: BackgroundTasks):
-    global is_logging, log_data, current_log_id
+    global is_logging, log_data, current_log_id, stop_logging_event, logging_thread
     
     if not is_logging:
         return {"status": "not_logging", "message": "Logging is not in progress"}
+    
+    # Signal the logging thread to stop
+    stop_logging_event.set()
+    
+    # Wait for the thread to finish
+    if logging_thread and logging_thread.is_alive():
+        print("⏳ Waiting for logging thread to complete...")
+        logging_thread.join(timeout=5.0)  # Wait up to 5 seconds
     
     if len(log_data) == 0:
         is_logging = False
@@ -356,6 +360,29 @@ async def list_logs():
             })
     
     return sorted(log_files, key=lambda x: x["id"])
+
+@app.get("/logging/debug")
+async def debug_logging():
+    global signals_to_log, is_logging, log_interval, log_data
+    
+    sample_vehicle_data = {}
+    if vehicle_data:
+        sample_keys = list(vehicle_data.keys())[:5]
+        sample_vehicle_data = {k: vehicle_data[k] for k in sample_keys}
+    
+    thread_status = "Running" if logging_thread and logging_thread.is_alive() else "Not running"
+    
+    return {
+        "is_logging": is_logging,
+        "log_interval_ms": log_interval * 1000,
+        "logging_thread_status": thread_status,
+        "signals_to_log": signals_to_log,
+        "signals_to_log_count": len(signals_to_log) if signals_to_log else 0,
+        "log_entries_count": len(log_data),
+        "sample_vehicle_data_keys": list(vehicle_data.keys())[:10] if vehicle_data else [],
+        "vehicle_data_count": len(vehicle_data) if vehicle_data else 0,
+        "sample_vehicle_data": sample_vehicle_data
+    }
 
 # Helper function to save log data to CSV
 def save_log_to_csv(data: List[Dict[str, Any]], filepath: str):
@@ -421,12 +448,18 @@ def cleanup_old_logs(max_files_to_keep=5):
 # Gracefully handle shutdown
 @app.on_event("shutdown")
 def shutdown_event():
-    global run_can_receiver, is_logging
+    global run_can_receiver, is_logging, stop_logging_event, logging_thread
     print("🛑 Shutting down CAN receiver")
     
     # Stop logging if active
     if is_logging:
         print("⚠️ Logging was active during shutdown, attempting to save data...")
+        stop_logging_event.set()
+        
+        # Wait briefly for the logging thread to exit
+        if logging_thread and logging_thread.is_alive():
+            logging_thread.join(timeout=2.0)
+            
         is_logging = False
         
         if log_data and len(log_data) > 0:
